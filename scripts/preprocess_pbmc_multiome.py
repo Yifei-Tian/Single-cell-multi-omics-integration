@@ -25,30 +25,30 @@ def read_10x_h5(path: Path) -> tuple[sparse.csc_matrix, pd.DataFrame, pd.Index]:
     # 读取 10x Genomics 的 filtered_feature_bc_matrix.h5 文件。
     # 这个文件里 RNA 和 ATAC 共用同一个稀疏矩阵，后续再按 feature_type 拆分。
     with h5py.File(path, "r") as handle:
-        group = handle["matrix"] # 从整个 h5 文件里，取出 matrix 这一层内容，并赋值给变量 group
+        group = handle["matrix"]  # 从整个 h5 文件里，取出 matrix 这一层内容，并赋值给变量 group
         # 10x h5 使用 CSC（compressed sparse column）格式存储矩阵三元组。
-        matrix = sparse.csc_matrix( # 创建 csc 格式的稀疏矩阵
+        matrix = sparse.csc_matrix(  # 创建 csc 格式的稀疏矩阵
             (
-                group["data"][:], # 所有非零元素的值，
+                group["data"][:],  # 所有非零元素的值，
                 # 因为 group["data"] 是 h5 文件里的一个数据集对象，不是普通 numpy 数组，加上 [:] 才是把它完整读到内存里。
-                group["indices"][:], # 所有非零元素所在的“行号”
-                group["indptr"][:], # 每一列在 data 里的起止位置索引
+                group["indices"][:],  # 所有非零元素所在的“行号”
+                group["indptr"][:],  # 每一列在 data 里的起止位置索引
             ),
-            shape=tuple(group["shape"][:]), # 矩阵的总形状（行数，列数）
+            shape=tuple(group["shape"][:]),  # 矩阵的总形状（行数，列数）
         )
         # features 表保存每一行特征的注释信息，比如基因名、峰区间、模态类型等。
         features = pd.DataFrame(
             {
-                "feature_id": decode_array(group["features"]["id"][:]), # 特征的唯一标识符
-                "feature_name": decode_array(group["features"]["name"][:]), # 特征的常规名称
-                "feature_type": decode_array(group["features"]["feature_type"][:]), # 特征的类型
-                "genome": decode_array(group["features"]["genome"][:]), # 特征所在的基因组（通常是 "hg38" 或 "mm10"）
-                "interval": decode_array(group["features"]["interval"][:]), # 对于 ATAC 峰来说是峰的区间信息，对于基因来说通常是空字符串
+                "feature_id": decode_array(group["features"]["id"][:]),  # 特征的唯一标识符
+                "feature_name": decode_array(group["features"]["name"][:]),  # 特征的常规名称
+                "feature_type": decode_array(group["features"]["feature_type"][:]),  # 特征的类型
+                "genome": decode_array(group["features"]["genome"][:]),  # 特征所在的基因组（通常是 "hg38" 或 "mm10"）
+                "interval": decode_array(group["features"]["interval"][:]),  # 对于 ATAC 峰来说是峰的区间信息，对于基因来说通常是空字符串
             }
             # decode_array(...)：这是一个自定义的函数。因为 HDF5 文件中的字符串常常以二进制字节（如 b'ENSG000001'）的形式存储
             # decode_array 的作用就是将这些字节阵列解码为普通的 Python 字符串。
         )
-        barcodes = pd.Index(decode_array(group["barcodes"][:]), name="barcode") # 细胞索引，用作表达量矩阵的行名和列名
+        barcodes = pd.Index(decode_array(group["barcodes"][:]), name="barcode")  # 细胞索引，用作表达量矩阵的行名和列名
     return matrix, features, barcodes
 
 
@@ -62,6 +62,22 @@ def subset_rows(matrix: sparse.csc_matrix, mask: np.ndarray) -> sparse.csc_matri
     return matrix[mask, :]
 
 
+def make_unique(values: np.ndarray) -> list[str]:
+    # 10x 数据里可能存在重复特征名，这会导致 AnnData 给出重复 var_names 警告。
+    # 这里用 name, name-1, name-2 的方式保证索引唯一。
+    counts: dict[str, int] = {}
+    result: list[str] = []
+    for value in values:
+        key = str(value)
+        count = counts.get(key, 0)
+        if count == 0:
+            result.append(key)
+        else:
+            result.append(f"{key}-{count}")
+        counts[key] = count + 1
+    return result
+
+
 def matrix_to_adata(
     matrix: sparse.csc_matrix,
     var: pd.DataFrame,
@@ -69,7 +85,11 @@ def matrix_to_adata(
 ) -> ad.AnnData:
     # AnnData 约定行为细胞、列为特征，因此这里要把 10x 原始矩阵转置。
     obs = pd.DataFrame(index=obs_index.copy())
-    var = var.copy().set_index("feature_name", drop=False)
+
+    # 保留 feature_name 这一列用于注释，但不要把索引名也设成 feature_name，
+    # 否则 write_h5ad() 会因为 DataFrame 索引名与列名冲突而报错。
+    var = var.copy()
+    var.index = pd.Index(make_unique(var["feature_name"].to_numpy()), name="var_name")
     return ad.AnnData(X=matrix.transpose().tocsr(), obs=obs, var=var)
 
 
@@ -186,19 +206,18 @@ def detect_doublets(
 
 def main() -> None:
     # 允许从命令行指定输入和输出路径，便于复用到其他样本。
-    parser = argparse.ArgumentParser(description="Preprocess 10x multiome PBMC data.") # 创建了参数解析器对象，询问时打印脚本功能
+    parser = argparse.ArgumentParser(description="Preprocess 10x multiome PBMC data.")
     parser.add_argument(
-        "--input-h5", # 定义参数名字，前面的--代表是可选参数
+        "--input-h5",
         default="data/pbmc_granulocyte_sorted_10k_filtered_feature_bc_matrix.h5",
-        type=Path, # 说明是Path对象
+        type=Path,
     )
     parser.add_argument(
         "--output-dir",
         default="outputs/pbmc_granulocyte_sorted_10k",
         type=Path,
     )
-    args = parser.parse_args() # 读取用户在终端中输入的命令，把对应的参数提取出来，并打包存储到 args 对象中。
-    # 在代码中通过 args.input_h5 和 args.output_dir 来调用用户输入（或默认）的路径
+    args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     matrix, features, barcodes = read_10x_h5(args.input_h5)
